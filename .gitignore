@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.hf_home/
+.env

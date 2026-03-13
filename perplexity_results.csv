@@ -1,0 +1,13 @@
+metric,value
+model_checkpoint,meta-llama/Meta-Llama-3.1-8B
+dataset,wikitext-2-raw-v1:test
+group_size,64
+block_size,1024
+test_rows,284
+regular_model_size_mb,15316.51
+quantized_model_size_mb,5028.32
+quantized_linear_layers,225
+regular_model_perplexity,13.0328
+quantized_model_perplexity,15.3972
+perplexity_delta,2.3644
+status,completed
