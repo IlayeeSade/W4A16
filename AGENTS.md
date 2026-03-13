@@ -1,54 +1,75 @@
 # W4A16 Project Guide
 
 ## Purpose
-This project compares language-model perplexity before and after 4-bit weight quantization.
-The current workflow:
+This repo studies one question: how a custom W4A16 quantized path compares with the regular BF16 Hugging Face path for `meta-llama/Meta-Llama-3.1-8B`.
 
-1. Load a causal LM checkpoint.
-2. Replace `nn.Linear` layers with `QuantizedLinear4bit`.
-3. Evaluate perplexity for the regular model on WikiText-2.
-4. Evaluate perplexity for the quantized model on WikiText-2.
-5. Print a side-by-side summary.
+The project has three active tracks:
 
-## Repository Layout
-- `initial_script.py`: main entrypoint for loading the model, quantizing it, and running both perplexity evaluations.
-- `quantization.py`: weight packing, quantization, dequantization, and `QuantizedLinear4bit`.
-- `evaluation.py`: WikiText-2 preparation and perplexity calculation.
-- `sanity_checks.py`: forward-pass comparison helper for regular vs quantized logits.
-- `w4a16_cuda.cu`: CUDA extension source for a custom W4A16 forward path.
+1. perplexity on WikiText-2
+2. forward-speed benchmarking
+3. kernel-integration analysis
 
-## Known Runtime Constraint
-The default Hugging Face cache path in this environment points into `/workspace`, which sits on a small overlay filesystem.
-`meta-llama/Meta-Llama-3.1-8B` does load correctly on this machine, but it fails if the cache lives on `/workspace` because the model shards exhaust the overlay.
+## Main Variants
+- `Regular BF16`: unquantized Hugging Face baseline.
+- `QuantizedLinear4bit`: Python dequantization path, used for perplexity experiments.
+- `Repo CUDA Kernel W4A16`: repo kernel wrapper using [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu).
+- `Repo Direct-Input CUDA W4A16`: same kernel body, different host wrapper in [w4a16_cuda_direct.cu](/workspace/W4A16/w4a16_cuda_direct.cu).
+- `LMDeploy AWQ`: external speed-only comparison target.
 
-Use:
+## Core Files
+- [initial_script.py](/workspace/W4A16/initial_script.py): main perplexity entrypoint.
+- [evaluation.py](/workspace/W4A16/evaluation.py): WikiText-2 loading and perplexity calculation.
+- [quantization.py](/workspace/W4A16/quantization.py): packing, quantization, dequantization, and quantized linear modules.
+- [sanity_checks.py](/workspace/W4A16/sanity_checks.py): forward correctness check.
+- [forward_pass_benchmark.py](/workspace/W4A16/forward_pass_benchmark.py): single-layer and full-model latency benchmark.
+- [kernel_only_benchmark.py](/workspace/W4A16/kernel_only_benchmark.py): isolated dense-BF16 vs kernel-only comparison.
+- [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu): original CUDA kernel wrapper.
+- [w4a16_cuda_direct.cu](/workspace/W4A16/w4a16_cuda_direct.cu): same kernel structure with direct-input host wrapper.
+- [previous_benchmarking.py](/workspace/W4A16/previous_benchmarking.py): earlier synthetic reference benchmark.
+- [README.md](/workspace/W4A16/README.md): user-facing repo summary.
+- [explanation.md](/workspace/W4A16/explanation.md): why the kernel still loses to BF16 here.
+- [story_explanation.md](/workspace/W4A16/story_explanation.md): full session narrative and experiment history.
 
+## Current Known Results
+- Perplexity:
+  regular `13.0328`
+  quantized `15.3972`
+- Full-model decode latency:
+  regular BF16 `38.477 ms`
+  repo kernel `108.699 ms`
+  repo direct-input kernel `108.526 ms`
+- Kernel-only benchmark:
+  dense BF16 still beats both repo kernel variants across tested sizes.
+
+## Runtime Constraints
+- Use `/dev/shm` for Hugging Face cache and temp files on this machine.
+- Recommended env:
+  `HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp`
+- The Llama 8B checkpoint is gated and needs a valid `HF_TOKEN`.
+- LMDeploy AWQ artifact generation works locally, but LMDeploy runtime benchmarking is currently blocked by the environment on this CUDA 13 / Blackwell stack.
+
+## Recommended Commands
+Perplexity:
 ```bash
+mkdir -p /dev/shm/hf_home /dev/shm/tmp
 HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/initial_script.py
 ```
 
-`/dev/shm` provides enough temporary space for the active model download/load path in this environment.
-
-## Operational Notes
-- The current script uses `meta-llama/Meta-Llama-3.1-8B`.
-- The current script expects a valid Hugging Face token for gated model access.
-- GPU inference is used when CUDA is available.
-- CPU RAM on this machine is sufficient to hold both the original and quantized model copies.
-- The quantized forward path currently dequantizes on the fly, so it is expected to be slower than the regular model even if memory use is reduced.
-
-## Status Meanings
-- `Loading tokenizer/model`: Hugging Face checkpoint access and weight loading.
-- `Preparing WikiText-2 dataset`: dataset download/tokenization/chunking.
-- `Quantizing model`: replacing `nn.Linear` layers with quantized modules.
-- `Calculating perplexity`: evaluating average cross-entropy over the WikiText-2 test split.
-- `Perplexity Comparison`: final result summary for regular vs quantized models.
-
-## Recommended Run Procedure
-1. Clear partial failed checkpoint downloads if `/workspace/.hf_home` filled up during a prior run.
-2. Run the script with `HF_HOME=/dev/shm/hf_home` and `TMPDIR=/dev/shm/tmp`.
-3. Capture the console output to a log if you want a persistent artifact:
-
+Repo benchmark:
 ```bash
-mkdir -p /dev/shm/hf_home /dev/shm/tmp
-HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/initial_script.py | tee /workspace/W4A16/perplexity_run.log
+HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/forward_pass_benchmark.py \
+  --hf-token "$HF_TOKEN" \
+  --enable-cuda-kernel \
+  --enable-direct-cuda-kernel
 ```
+
+Kernel-only benchmark:
+```bash
+python /workspace/W4A16/kernel_only_benchmark.py
+```
+
+## Working Rules For Future Changes
+- Keep the original kernel in [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu) as the baseline unless the task explicitly says to change it.
+- Put kernel experiments in separate CUDA files when possible.
+- Treat LMDeploy as speed-only unless a task explicitly asks for something else.
+- Keep commits small and milestone-based.
