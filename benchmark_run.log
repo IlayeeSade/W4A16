@@ -1,0 +1,38 @@
+Building/loading local CUDA extension ...
+Running on: cuda
+
+========================================================================
+BENCHMARK: Single Linear Layer
+========================================================================
+
+Variant                     Mean (ms)     Std (ms)   vs regular
+----------------------------------------------------------------
+Regular BF16                    0.059        0.004         1.00x
+Repo Python W4A16               1.479        0.003         0.04x
+Repo CUDA Kernel W4A16          0.274        0.002         0.22x
+
+========================================================================
+BENCHMARK: Full Model Decode Forward
+========================================================================
+model       : meta-llama/Meta-Llama-3.1-8B
+group_size  : 64
+device      : cuda
+repetitions : 2
+
+Loading model to CPU ...
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 129.78it/s]
+Model loaded.
+Quantizing Python W4A16 model ...
+Quantizing CUDA-kernel W4A16 model ...
+
+Benchmarking regular model ...
+Benchmarking Python W4A16 model ...
+Benchmarking CUDA-kernel W4A16 model ...
+
+Variant                     Mean (ms)     Std (ms)   vs regular
+----------------------------------------------------------------
+Regular BF16                   36.558        0.718         1.00x
+Repo Python W4A16             772.200        0.031         0.05x
+Repo CUDA Kernel W4A16        109.108        0.088         0.34x
+Wrote benchmark results to /workspace/W4A16/benchmark_results.json
+Wrote benchmark plot to /workspace/W4A16/benchmark_plot.png

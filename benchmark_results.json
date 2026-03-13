@@ -1,0 +1,44 @@
+{
+  "model_checkpoint": "meta-llama/Meta-Llama-3.1-8B",
+  "device": "cuda",
+  "group_size": 64,
+  "layer_results_ms": {
+    "regular_bf16": {
+      "mean": 0.05902145057916641,
+      "std": 0.0036312881143740856
+    },
+    "repo_python_w4a16": {
+      "mean": 1.478601060807705,
+      "std": 0.0033769549408850102
+    },
+    "repo_cuda_kernel_w4a16": {
+      "mean": 0.27377335354685783,
+      "std": 0.001998529450701845
+    }
+  },
+  "full_model_results_ms": {
+    "regular_bf16": {
+      "mean": 36.558284657076,
+      "std": 0.71766303628109
+    },
+    "repo_python_w4a16": {
+      "mean": 772.1997713670135,
+      "std": 0.03129732774187873
+    },
+    "repo_cuda_kernel_w4a16": {
+      "mean": 109.10762287676334,
+      "std": 0.08795586303067997
+    }
+  },
+  "variant_descriptions": {
+    "regular_bf16": "Unquantized Hugging Face model in BF16.",
+    "repo_python_w4a16": "This repo's W4A16 path using Python dequantization in forward().",
+    "repo_cuda_kernel_w4a16": "This repo's W4A16 path using the local CUDA kernel from w4a16_cuda.cu.",
+    "lmdeploy_awq_pytorch": "LMDeploy AWQ model using LMDeploy's PyTorch backend.",
+    "lmdeploy_awq_turbomind": "LMDeploy AWQ model using LMDeploy's TurboMind backend."
+  },
+  "notes": [
+    "LMDeploy comparison is speed-only and measures end-to-end generation latency for max_new_tokens=1.",
+    "Regular BF16 / repo Python W4A16 / repo CUDA-kernel W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1]."
+  ]
+}
