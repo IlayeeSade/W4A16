@@ -1,0 +1,78 @@
+{
+  "device": "cuda",
+  "group_size": 64,
+  "cases": [
+    {
+      "of": 4096,
+      "if": 8192,
+      "dense_bf16_ms": {
+        "mean": 0.13695894740521908,
+        "std": 0.003588591437194844
+      },
+      "repo_kernel_ms": {
+        "mean": 0.4755579214543104,
+        "std": 0.0023855136583441697
+      },
+      "direct_kernel_ms": {
+        "mean": 0.4818621790036559,
+        "std": 0.002093183827056269
+      },
+      "repo_kernel_speedup_vs_dense": 0.2879963538119247,
+      "direct_kernel_speedup_vs_dense": 0.2842284648452975
+    },
+    {
+      "of": 8192,
+      "if": 8192,
+      "dense_bf16_ms": {
+        "mean": 0.24538469035178423,
+        "std": 0.0021738798944370284
+      },
+      "repo_kernel_ms": {
+        "mean": 0.9304585866630077,
+        "std": 0.003044165875870904
+      },
+      "direct_kernel_ms": {
+        "mean": 0.9362970152869821,
+        "std": 0.0023435508300578877
+      },
+      "repo_kernel_speedup_vs_dense": 0.2637244621835677,
+      "direct_kernel_speedup_vs_dense": 0.26207996644801007
+    },
+    {
+      "of": 16384,
+      "if": 8192,
+      "dense_bf16_ms": {
+        "mean": 0.4618134954944253,
+        "std": 0.0017724071055087044
+      },
+      "repo_kernel_ms": {
+        "mean": 1.7281355429440737,
+        "std": 0.002493364866225754
+      },
+      "direct_kernel_ms": {
+        "mean": 1.736536044627428,
+        "std": 0.007166914757175871
+      },
+      "repo_kernel_speedup_vs_dense": 0.2672322187805211,
+      "direct_kernel_speedup_vs_dense": 0.2659394816037388
+    },
+    {
+      "of": 32768,
+      "if": 8192,
+      "dense_bf16_ms": {
+        "mean": 0.8984179329127073,
+        "std": 0.0019388825482053935
+      },
+      "repo_kernel_ms": {
+        "mean": 3.4278363129124045,
+        "std": 0.005509471785504161
+      },
+      "direct_kernel_ms": {
+        "mean": 3.4314951952546835,
+        "std": 0.0033223302715593202
+      },
+      "repo_kernel_speedup_vs_dense": 0.2620947591716774,
+      "direct_kernel_speedup_vs_dense": 0.26181529677066245
+    }
+  ]
+}

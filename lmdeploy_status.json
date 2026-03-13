@@ -1,0 +1,21 @@
+{
+  "artifact_path": "/workspace/W4A16/lmdeploy_awq_llama31_8b",
+  "artifact_status": "created",
+  "benchmark_status": "failed",
+  "attempted_backends": {
+    "pytorch": {
+      "status": "failed",
+      "error_type": "InductorError",
+      "error_summary": "LMDeploy failed during Triton/Inductor startup on this CUDA 13 / Blackwell environment."
+    },
+    "turbomind": {
+      "status": "failed",
+      "error_type": "InductorError",
+      "error_summary": "The local LMDeploy run still failed during Triton/Inductor startup before a stable latency measurement could be produced."
+    }
+  },
+  "notes": [
+    "The LMDeploy AWQ model artifact itself was generated successfully from the cached Meta-Llama-3.1-8B checkpoint.",
+    "The failure is in the local LMDeploy runtime environment, not in the repo's CUDA kernel path."
+  ]
+}

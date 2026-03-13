@@ -22,7 +22,9 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoModelForCausalLM
 
 from quantization import (
+    CudaDirectQuantizedLinear4bit,
     CudaKernelQuantizedLinear4bit,
+    load_w4a16_cuda_direct_extension,
     load_w4a16_cuda_extension,
     quantize_model_layers,
 )
@@ -31,6 +33,7 @@ from quantization import (
 VARIANT_LABELS = {
     "regular_bf16": "Regular BF16",
     "repo_cuda_kernel_w4a16": "Repo CUDA Kernel W4A16",
+    "repo_direct_cuda_w4a16": "Repo Direct-Input CUDA W4A16",
     "lmdeploy_awq_pytorch": "LMDeploy AWQ (PyTorch)",
     "lmdeploy_awq_turbomind": "LMDeploy AWQ (TurboMind)",
 }
@@ -73,6 +76,7 @@ def bench_single_linear(
     n_runs: int,
     device: torch.device,
     cuda_ext=None,
+    direct_cuda_ext=None,
 ):
     print("\n" + "=" * 72)
     print("BENCHMARK: Single Linear Layer")
@@ -86,6 +90,13 @@ def bench_single_linear(
             group_size,
             cuda_ext=cuda_ext,
         ).to(device).eval()
+    direct_cuda_quant = None
+    if direct_cuda_ext is not None and device.type == "cuda":
+        direct_cuda_quant = CudaDirectQuantizedLinear4bit.from_linear(
+            copy.deepcopy(regular).cpu(),
+            group_size,
+            cuda_ext=direct_cuda_ext,
+        ).to(device).eval()
 
     x = torch.randn(1, 1, in_features, dtype=torch.bfloat16, device=device)
     results = {}
@@ -97,6 +108,10 @@ def bench_single_linear(
         if cuda_quant is not None:
             warmup(lambda: cuda_quant(x))
             results["repo_cuda_kernel_w4a16"] = measure_ms(lambda: cuda_quant(x), n_runs)
+
+        if direct_cuda_quant is not None:
+            warmup(lambda: direct_cuda_quant(x))
+            results["repo_direct_cuda_w4a16"] = measure_ms(lambda: direct_cuda_quant(x), n_runs)
 
     print_results_table(results)
     return results
@@ -152,6 +167,7 @@ def bench_full_model(
     n_runs: int,
     device: torch.device,
     cuda_ext=None,
+    direct_cuda_ext=None,
     lmdeploy_model_path: str | None = None,
     lmdeploy_backend: str = "pytorch",
 ):
@@ -185,6 +201,16 @@ def bench_full_model(
             cuda_ext=cuda_ext,
         )
 
+    direct_cuda_quant_model = None
+    if direct_cuda_ext is not None and device.type == "cuda":
+        print("Quantizing direct-input CUDA-kernel W4A16 model ...")
+        _, direct_cuda_quant_model = quantize_model_layers(
+            base_model,
+            group_size,
+            linear_cls=CudaDirectQuantizedLinear4bit,
+            cuda_ext=direct_cuda_ext,
+        )
+
     input_ids = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
     results = {}
 
@@ -195,6 +221,17 @@ def bench_full_model(
         print("Benchmarking CUDA-kernel W4A16 model ...")
         results["repo_cuda_kernel_w4a16"] = bench_torch_model_variant(cuda_quant_model, input_ids, n_runs, device)
         del cuda_quant_model
+        gc.collect()
+
+    if direct_cuda_quant_model is not None:
+        print("Benchmarking direct-input CUDA-kernel W4A16 model ...")
+        results["repo_direct_cuda_w4a16"] = bench_torch_model_variant(
+            direct_cuda_quant_model,
+            input_ids,
+            n_runs,
+            device,
+        )
+        del direct_cuda_quant_model
         gc.collect()
 
     if lmdeploy_model_path:
@@ -274,6 +311,7 @@ def write_plot(path: str | None, payload: dict):
     footer = (
         "Regular BF16 = baseline Hugging Face model. "
         "Repo CUDA Kernel W4A16 = local CUDA extension path. "
+        "Repo Direct-Input CUDA W4A16 = same kernel with input reshaping moved into the extension. "
         "LMDeploy AWQ = optional external speed-only comparison."
     )
     draw.text((40, 720), footer, fill="#444444", font=font)
@@ -289,6 +327,17 @@ def maybe_load_cuda_extension(enable: bool):
         return load_w4a16_cuda_extension(verbose=False)
     except Exception as exc:
         print(f"[WARN] CUDA extension unavailable: {type(exc).__name__}: {exc}")
+        return None
+
+
+def maybe_load_direct_cuda_extension(enable: bool):
+    if not enable:
+        return None
+    try:
+        print("Building/loading direct-input CUDA extension ...")
+        return load_w4a16_cuda_direct_extension(verbose=False)
+    except Exception as exc:
+        print(f"[WARN] Direct-input CUDA extension unavailable: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -310,6 +359,7 @@ def parse_args():
     parser.add_argument("--layer-in-features", type=int, default=4096)
     parser.add_argument("--layer-out-features", type=int, default=4096)
     parser.add_argument("--enable-cuda-kernel", action="store_true")
+    parser.add_argument("--enable-direct-cuda-kernel", action="store_true")
     parser.add_argument("--lmdeploy-model-path", default=None)
     parser.add_argument("--lmdeploy-backend", choices=["pytorch", "turbomind"], default="pytorch")
     parser.add_argument("--results-json", default=None)
@@ -321,6 +371,7 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
     cuda_ext = maybe_load_cuda_extension(args.enable_cuda_kernel)
+    direct_cuda_ext = maybe_load_direct_cuda_extension(args.enable_direct_cuda_kernel)
 
     print(f"Running on: {device}")
     if args.lmdeploy_model_path:
@@ -333,6 +384,7 @@ def main():
         n_runs=args.layer_runs,
         device=device,
         cuda_ext=cuda_ext,
+        direct_cuda_ext=direct_cuda_ext,
     )
 
     model_results = bench_full_model(
@@ -342,6 +394,7 @@ def main():
         n_runs=args.model_runs,
         device=device,
         cuda_ext=cuda_ext,
+        direct_cuda_ext=direct_cuda_ext,
         lmdeploy_model_path=args.lmdeploy_model_path,
         lmdeploy_backend=args.lmdeploy_backend,
     )
@@ -355,12 +408,13 @@ def main():
         "variant_descriptions": {
             "regular_bf16": "Unquantized Hugging Face model in BF16.",
             "repo_cuda_kernel_w4a16": "This repo's W4A16 path using the local CUDA kernel from w4a16_cuda.cu.",
+            "repo_direct_cuda_w4a16": "Same kernel structure, but wrapped by w4a16_cuda_direct.cu so Python forward passes the original activation tensor directly.",
             "lmdeploy_awq_pytorch": "LMDeploy AWQ model using LMDeploy's PyTorch backend.",
             "lmdeploy_awq_turbomind": "LMDeploy AWQ model using LMDeploy's TurboMind backend.",
         },
         "notes": [
             "LMDeploy comparison is speed-only and measures end-to-end generation latency for max_new_tokens=1.",
-            "Regular BF16 / repo CUDA-kernel W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1].",
+            "Regular BF16 / repo CUDA-kernel W4A16 / repo direct-input CUDA W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1].",
         ],
     }
     write_results(args.results_json, payload)

@@ -1,156 +1,118 @@
-# Why The Repo Kernel Benchmark Is Still Slower Than Regular BF16
+# Why The Kernel Is Still Slower Than BF16 In This Repo
 
-## Short Version
+## Short Answer
 
-`previous_benchmarking.py` and `forward_pass_benchmark.py` do not measure the same thing.
+The new direct-input wrapper proves that Python-side reshape/transpose is not the main bottleneck.
 
-- `previous_benchmarking.py` is an isolated kernel-style microbenchmark.
-- `forward_pass_benchmark.py` is the repo's actual model integration benchmark.
+The measured results are still:
 
-So it is completely plausible for the isolated benchmark to suggest that the kernel should be faster, while the repo's full-model decode benchmark is still slower than regular BF16.
+- full model decode: `Regular BF16 38.477 ms`
+- full model decode: `Repo CUDA Kernel W4A16 108.699 ms`
+- full model decode: `Repo Direct-Input CUDA W4A16 108.526 ms`
+- isolated GEMV: `dense BF16 0.1370 ms` vs `repo kernel 0.4756 ms` vs `direct-input kernel 0.4819 ms` at `OF=4096, IF=8192`
 
-## What `previous_benchmarking.py` Measures
+So the current kernel path is slower than BF16 even in the isolated benchmark on this machine.
 
-[previous_benchmarking.py](/workspace/W4A16/previous_benchmarking.py) measures a narrow synthetic setup:
+## What Changed
+
+I added [w4a16_cuda_direct.cu](/workspace/W4A16/w4a16_cuda_direct.cu) and [CudaDirectQuantizedLinear4bit in quantization.py](/workspace/W4A16/quantization.py).
+
+That change keeps the same kernel body and only changes the host wrapper contract:
+
+- old path: Python `forward()` flattened and transposed activations before calling the extension
+- new path: Python `forward()` passes the original activation tensor directly
+- new host wrapper: flattens/transposes internally and restores the output shape before returning
+
+This was the cleanest way to test "is Python-side shape handling the reason the repo path is slow?" without changing the kernel itself.
+
+The answer is no, or at least not in a way that matters here:
+
+- single layer: `0.272 ms` -> `0.265 ms`
+- full model: `108.699 ms` -> `108.526 ms`
+
+That is a tiny change, not a regime change.
+
+## Why `previous_benchmarking.py` Looked More Promising
+
+[previous_benchmarking.py](/workspace/W4A16/previous_benchmarking.py) is still useful, but it is not the same experiment as the repo benchmark.
+
+It is closer to a best-case synthetic setup:
 
 - random tensors
-- one matrix-vector style operation at a time
-- direct invocation of the CUDA extension wrapper
-- a direct dense baseline: `torch.matmul(...) + bias`
-- `float16` tensors
-- no Hugging Face model stack
-- no full transformer decode path
+- direct kernel invocation
+- one GEMV-like operation at a time
+- no Hugging Face decode stack
+- no repeated module traversal across the full transformer
 
-That makes it useful for answering:
+That means it can support the intuition that "the kernel should be competitive" without proving that the current repo integration beats the BF16 baseline end to end.
 
-"Can the custom kernel itself compete with a dense baseline in an isolated GEMV-like setup?"
+## What The Isolated Benchmark Says Now
 
-That is a valid and useful question.
+[kernel_only_benchmark.py](/workspace/W4A16/kernel_only_benchmark.py) measures the kernel more directly against a dense BF16 baseline using the same shapes as the repo experiments.
 
-## What The Repo Benchmark Measures
+Current results:
 
-[forward_pass_benchmark.py](/workspace/W4A16/forward_pass_benchmark.py) measures:
+- `OF=4096`: dense `0.1370 ms`, repo kernel `0.4756 ms`, direct-input kernel `0.4819 ms`
+- `OF=8192`: dense `0.2454 ms`, repo kernel `0.9305 ms`, direct-input kernel `0.9363 ms`
+- `OF=16384`: dense `0.4618 ms`, repo kernel `1.7281 ms`, direct-input kernel `1.7365 ms`
+- `OF=32768`: dense `0.8984 ms`, repo kernel `3.4278 ms`, direct-input kernel `3.4315 ms`
 
-- the actual `meta-llama/Meta-Llama-3.1-8B` model
-- one-token decode through the Hugging Face model path
-- every quantized linear call used by that decode
-- wrapper/layout overhead around the CUDA kernel
-- the rest of the model that is still not replaced by the kernel
+So in this environment I could not verify the claim that the current kernel is faster than dense BF16, even in the isolated microbenchmark.
 
-That is a different question:
+## Why BF16 Still Wins
 
-"Does this repo's current full-model W4A16 integration beat the regular BF16 model for one-token decode latency?"
+The dense BF16 baseline is not just "plain matmul". It is using mature library paths that the custom kernel does not get for free.
 
-Right now, the measured answer is no.
+I checked the active BLAS backend:
 
-## Why The Full Repo Path Can Still Be Slower
+- `torch.backends.cuda.preferred_blas_library() -> _BlasBackend.Cublas`
 
-### 1. Isolated kernel time is not full-model time
+I also profiled BF16 `torch.matmul(W, X)` on CUDA. The profiler shows:
 
-The CUDA kernel only replaces linear projections.
+- `aten::matmul`
+- `aten::mm`
+- an internal `gemvx`-style backend under the CUDA work
 
-The full decode step still includes:
+That means the dense BF16 baseline is benefiting from PyTorch + cuBLAS-backed kernels that are already tuned for this GPU and software stack.
 
-- embedding work
-- residual and normalization work
-- attention orchestration
-- model-level dispatch overhead
-- all non-kernel operations in the transformer stack
+In practice that means:
 
-Regular BF16 benefits from a mature dense execution path across the whole model.
+- the BF16 baseline has better kernel selection and dispatch
+- the BF16 path is likely getting hardware/library optimizations that our custom kernel wrapper does not match yet
+- beating BF16 requires more than removing a Python reshape
 
-### 2. The wrapper still has unavoidable layout work
+## What This Means For The Repo
 
-Even after simplifying `CudaKernelQuantizedLinear4bit.forward`, the kernel path still has to:
+The current repo gap is not explained by one obvious wrapper bug anymore.
 
-- reshape hidden states
-- transpose into the kernel's expected `[IF, B]` layout
-- make the tensor contiguous
-- launch the kernel
-- transpose the output back to model layout
+The evidence now points to a more fundamental issue:
 
-That overhead is paid for every quantized layer.
+- the kernel itself is not yet faster than the dense BF16 baseline on this machine
+- the full-model integration naturally stays slower because it stacks that slower kernel across many layers
 
-### 3. The baselines are different
+So the next useful experiments should stay outside [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu) and preserve the current kernel as the baseline:
 
-`previous_benchmarking.py` compares the kernel against a single dense `torch.matmul(...)`.
+1. try kernel changes in a separate experimental CUDA file
+2. measure one transformer block, not only kernel-only and full-model extremes
+3. compare BF16 and FP16 under exactly the same isolated conditions
+4. inspect whether dequantization math, memory access pattern, or launch geometry is the main limiter
 
-The repo benchmark compares the kernel-backed quantized model against the actual full Hugging Face BF16 model.
+## LMDeploy Status
 
-Those are not the same baseline.
+I also generated an LMDeploy AWQ artifact successfully at:
 
-### 4. The dtype setup is different
+- `/workspace/W4A16/lmdeploy_awq_llama31_8b`
 
-`previous_benchmarking.py` is mostly built around `float16`.
+But I could not produce a valid LMDeploy speed number on this machine.
 
-The repo benchmark is the BF16 model path.
+What failed:
 
-That alone can change which side looks better, depending on how the dense baseline and the kernel path map to the hardware/software stack.
+- first LMDeploy was missing `xgrammar`
+- after installing it, the LMDeploy runtime failed in Triton/Inductor startup
+- the error occurs on this CUDA 13 / Blackwell environment before a stable generation benchmark can run
 
-### 5. The previous script is closer to a best-case kernel scenario
+So the repo now has:
 
-The synthetic script gives the kernel a cleaner environment:
-
-- direct extension calls
-- fixed GEMV-style shapes
-- no repeated model traversal
-- no Hugging Face module plumbing
-
-That is much closer to "kernel-only" timing than to "model integration" timing.
-
-## One Concrete Repo Issue That Was Making Things Worse
-
-The original `CudaKernelQuantizedLinear4bit.forward` was doing extra device transfers inside `forward()`:
-
-- `self.W_packed.to(x.device)`
-- `bias.to(x.device)`
-- `self.SZ_packed.to(x.device)`
-
-Those copies were wrapper overhead, not kernel work.
-
-That has now been removed. The current `forward()` keeps only:
-
-- input layout preparation
-- kernel launch
-- output reshape back to model layout
-
-Even after removing those extra transfers, the repo's full-model benchmark still remains slower than regular BF16. That means the remaining gap is not explained by one obvious bug; it is mostly about integration cost and the difference between a microbenchmark and an end-to-end benchmark.
-
-## About AWQ In `previous_benchmarking.py`
-
-The script references `awq_kernel.cu`, but that file is not present in this repository.
-
-So `previous_benchmarking.py` should be treated as:
-
-- a useful reference script for benchmarking methodology
-- not a fully reproducible benchmark artifact for the current repo state
-
-## Suggested Next Step Without Changing The Current Kernel
-
-Do not modify [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu) if you want to preserve the current kernel as the baseline.
-
-If you want to test ideas, put them in a separate experimental file, for example:
-
-- `w4a16_cuda_experimental.cu`
-
-and keep the same overall kernel structure so changes stay attributable.
-
-The first things worth testing are:
-
-1. measuring kernel-only time separately from wrapper/layout time
-2. keeping activations in a layout closer to the kernel's expected input
-3. benchmarking one transformer block before benchmarking the entire model
-4. comparing BF16 and FP16 under the same isolated setup
-5. checking whether the dense BF16 baseline is benefiting from library paths that the isolated microbenchmark does not capture
-
-## Summary
-
-There is no contradiction between:
-
-- "`previous_benchmarking.py` suggests the kernel can be faster in isolation"
-
-and
-
-- "the repo's current full-model decode benchmark is still slower than regular BF16"
-
-They are different experiments with different scopes, different baselines, different dtypes, and different amounts of integration overhead.
+- a valid local LMDeploy AWQ model artifact
+- a reproduced LMDeploy runtime failure
+- no trustworthy LMDeploy latency number yet

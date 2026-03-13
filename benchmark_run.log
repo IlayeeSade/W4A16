@@ -1,4 +1,5 @@
 Building/loading local CUDA extension ...
+Building/loading direct-input CUDA extension ...
 Running on: cuda
 
 ========================================================================
@@ -7,8 +8,9 @@ BENCHMARK: Single Linear Layer
 
 Variant                     Mean (ms)     Std (ms)   vs regular
 ----------------------------------------------------------------
-Regular BF16                    0.059        0.004         1.00x
-Repo CUDA Kernel W4A16          0.272        0.002         0.22x
+Regular BF16                    0.058        0.004         1.00x
+Repo CUDA Kernel W4A16          0.272        0.003         0.21x
+Repo Direct-Input CUDA W4A16        0.265        0.004         0.22x
 
 ========================================================================
 BENCHMARK: Full Model Decode Forward
@@ -19,16 +21,19 @@ device      : cuda
 repetitions : 2
 
 Loading model to CPU ...
-Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 138.82it/s]
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00, 140.74it/s]
 Model loaded.
 Quantizing CUDA-kernel W4A16 model ...
+Quantizing direct-input CUDA-kernel W4A16 model ...
 
 Benchmarking regular model ...
 Benchmarking CUDA-kernel W4A16 model ...
+Benchmarking direct-input CUDA-kernel W4A16 model ...
 
 Variant                     Mean (ms)     Std (ms)   vs regular
 ----------------------------------------------------------------
-Regular BF16                   35.156        0.098         1.00x
-Repo CUDA Kernel W4A16        108.476        0.015         0.32x
+Regular BF16                   38.477        1.074         1.00x
+Repo CUDA Kernel W4A16        108.699        0.440         0.35x
+Repo Direct-Input CUDA W4A16      108.526        0.126         0.35x
 Wrote benchmark results to /workspace/W4A16/benchmark_results.json
 Wrote benchmark plot to /workspace/W4A16/benchmark_plot.png

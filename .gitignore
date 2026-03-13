@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .hf_home/
 .env
+lmdeploy_awq_llama31_8b/

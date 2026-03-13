@@ -1,6 +1,6 @@
 # W4A16 LLaMA Benchmark Repo
 
-This repository compares a regular causal language model against a naive W4A16 quantized variant on:
+This repository compares a regular causal language model against this repo's W4A16 variants on:
 
 1. WikiText-2 perplexity
 2. Single-layer forward speed
@@ -15,6 +15,7 @@ It also includes:
 
 - `Regular BF16`: the baseline Hugging Face model with no quantization.
 - `Repo CUDA Kernel W4A16`: this repo's quantized path using the local CUDA extension in [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu).
+- `Repo Direct-Input CUDA W4A16`: the same kernel, but wrapped by [w4a16_cuda_direct.cu](/workspace/W4A16/w4a16_cuda_direct.cu) so Python `forward()` passes the original activation tensor directly.
 - `LMDeploy AWQ`: LMDeploy's own AWQ implementation, benchmarked only for speed when you provide an LMDeploy-compatible model path.
 
 ## What Is Actually In This Repo
@@ -39,7 +40,8 @@ It also includes:
 
 - `quantization.py` implements naive per-group asymmetric 4-bit weight quantization.
 - `QuantizedLinear4bit` stores packed 4-bit weights and dequantizes them on the fly in Python during `forward`.
-- `CudaKernelQuantizedLinear4bit` is available for benchmarking and uses the local CUDA extension in `w4a16_cuda.cu`.
+- `CudaKernelQuantizedLinear4bit` uses the local CUDA extension in `w4a16_cuda.cu`.
+- `CudaDirectQuantizedLinear4bit` uses `w4a16_cuda_direct.cu` to move activation flatten/transpose work out of Python `forward()` while keeping the kernel body unchanged.
 - `quantize_model_layers(...)` deep-copies a model and replaces every `nn.Linear`.
 
 ### Perplexity path
@@ -54,6 +56,7 @@ It also includes:
 
 - `Regular BF16`: baseline `nn.Linear` / baseline full model
 - `Repo CUDA Kernel W4A16`: this repo's local CUDA kernel path
+- `Repo Direct-Input CUDA W4A16`: same kernel, but with activation layout preparation moved into the extension wrapper
 - optional `LMDeploy AWQ`: an LMDeploy AWQ model path, speed only, not perplexity
 
 ## Known Runtime Constraint
@@ -70,7 +73,7 @@ HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/initial_scr
 Use the same cache redirection for the benchmark:
 
 ```bash
-HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/forward_pass_benchmark.py --hf-token "$HF_TOKEN" --enable-cuda-kernel
+HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/forward_pass_benchmark.py --hf-token "$HF_TOKEN" --enable-cuda-kernel --enable-direct-cuda-kernel
 ```
 
 ## Perplexity Result In This Repo
@@ -94,24 +97,28 @@ From the latest smoke run in [benchmark_run.log](/workspace/W4A16/benchmark_run.
 The plot is meant to answer one question quickly:
 
 - `Regular BF16` is the baseline to beat.
-- `Repo CUDA Kernel W4A16` shows what improves once the heavy part moves into the local CUDA kernel.
+- `Repo CUDA Kernel W4A16` is the original repo wrapper.
+- `Repo Direct-Input CUDA W4A16` removes Python-side reshape/transpose from `forward()`, but keeps the same kernel body.
 - `LMDeploy AWQ`, when provided, is an external reference point for speed only.
 
 ### Single Linear Layer
 
-- `Regular BF16`: `0.059 ms`
+- `Regular BF16`: `0.058 ms`
 - `Repo CUDA Kernel W4A16`: `0.272 ms`
+- `Repo Direct-Input CUDA W4A16`: `0.265 ms`
 
 ### Full Model, One Decode Token
 
-- `Regular BF16`: `35.156 ms`
-- `Repo CUDA Kernel W4A16`: `108.476 ms`
+- `Regular BF16`: `38.477 ms`
+- `Repo CUDA Kernel W4A16`: `108.699 ms`
+- `Repo Direct-Input CUDA W4A16`: `108.526 ms`
 
 These numbers show the intended comparison clearly:
 
-- the repo-local CUDA kernel path is still slower than the regular BF16 baseline in the current end-to-end benchmark
-- the important question is now isolated kernel speed versus full-model integration cost
-- [explanation.md](/workspace/W4A16/explanation.md) explains why `previous_benchmarking.py` can plausibly suggest a faster kernel while the repo benchmark still comes out slower
+- moving the Python reshape/transpose into a new CUDA host wrapper does not materially change the result
+- both repo-local CUDA kernel paths are still slower than the regular BF16 baseline in the current end-to-end benchmark
+- the important question is now isolated kernel speed versus full-model integration cost and BF16 library advantages
+- [explanation.md](/workspace/W4A16/explanation.md) explains the gap and records the isolated benchmark result
 
 ## LMDeploy Comparison
 
@@ -121,6 +128,7 @@ These numbers show the intended comparison clearly:
 HF_HOME=/dev/shm/hf_home TMPDIR=/dev/shm/tmp python /workspace/W4A16/forward_pass_benchmark.py \
   --hf-token "$HF_TOKEN" \
   --enable-cuda-kernel \
+  --enable-direct-cuda-kernel \
   --lmdeploy-model-path /path/to/awq-model \
   --lmdeploy-backend pytorch
 ```
@@ -132,6 +140,12 @@ Notes:
 - it expects an already prepared LMDeploy-compatible AWQ model path
 - the benchmark measures end-to-end generation latency for `max_new_tokens=1`, not raw Hugging Face `forward(...)`
 
+Current status on this machine:
+
+- an LMDeploy AWQ artifact was generated successfully at `/workspace/W4A16/lmdeploy_awq_llama31_8b`
+- benchmarking it is currently blocked by the local LMDeploy runtime, not by the model artifact
+- the failing path is LMDeploy's Triton/Inductor startup on this CUDA 13 / Blackwell environment, so there is no valid LMDeploy latency number in the repo yet
+
 ## Files
 
 - [initial_script.py](/workspace/W4A16/initial_script.py): perplexity entrypoint
@@ -139,9 +153,11 @@ Notes:
 - [quantization.py](/workspace/W4A16/quantization.py): quantization helpers and quantized linear modules
 - [sanity_checks.py](/workspace/W4A16/sanity_checks.py): forward-output comparison helper
 - [forward_pass_benchmark.py](/workspace/W4A16/forward_pass_benchmark.py): speed benchmark entrypoint
+- [kernel_only_benchmark.py](/workspace/W4A16/kernel_only_benchmark.py): isolated dense-BF16 vs kernel-only GEMV benchmark
 - [previous_benchmarking.py](/workspace/W4A16/previous_benchmarking.py): older isolated benchmark script used as a reference point for kernel-vs-BF16 intuition
 - [explanation.md](/workspace/W4A16/explanation.md): why the isolated kernel result can look faster while the repo full-model benchmark stays slower
 - [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu): CUDA extension source
+- [w4a16_cuda_direct.cu](/workspace/W4A16/w4a16_cuda_direct.cu): same kernel structure with a different host wrapper so Python `forward()` passes activations directly
 
 ## What This README Does Not Claim
 

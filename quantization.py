@@ -192,6 +192,15 @@ def load_w4a16_cuda_extension(verbose: bool = False):
     )
 
 
+def load_w4a16_cuda_direct_extension(verbose: bool = False):
+    source_path = Path(__file__).with_name("w4a16_cuda_direct.cu")
+    return load_torch_extension(
+        name="w4a16_cuda_direct_ext_v7",
+        sources=[str(source_path)],
+        verbose=verbose,
+    )
+
+
 class CudaKernelQuantizedLinear4bit(QuantizedLinear4bit):
     def __init__(
         self,
@@ -242,6 +251,55 @@ class CudaKernelQuantizedLinear4bit(QuantizedLinear4bit):
             self.group_size,
         )
         return out.transpose(0, 1).contiguous().view(*x.shape[:-1], self.out_features)
+
+
+class CudaDirectQuantizedLinear4bit(QuantizedLinear4bit):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        group_size: int,
+        cuda_ext,
+        bias: bool = True,
+    ):
+        super().__init__(in_features, out_features, group_size, bias=bias)
+        self.cuda_ext = cuda_ext
+        if bias:
+            self.register_buffer("_zero_bias", None)
+        else:
+            self.register_buffer("_zero_bias", torch.zeros(out_features, dtype=torch.bfloat16))
+
+    @classmethod
+    def from_linear(cls, linear_module: nn.Linear, group_size: int, cuda_ext):
+        W_packed, SZ_packed = quantize_weights(linear_module.weight.data, group_size)
+        qmod = cls(
+            linear_module.in_features,
+            linear_module.out_features,
+            group_size,
+            cuda_ext=cuda_ext,
+            bias=linear_module.bias is not None,
+        )
+        qmod.W_packed = W_packed
+        qmod.SZ_packed = SZ_packed
+        if linear_module.bias is not None:
+            qmod.bias.data.copy_(linear_module.bias.data.to(torch.bfloat16))
+        return qmod
+
+    def _kernel_bias(self) -> torch.Tensor:
+        return self.bias if self.bias is not None else self._zero_bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            return super().forward(x)
+
+        kernel_x = x if x.dtype == torch.bfloat16 and x.is_contiguous() else x.to(torch.bfloat16).contiguous()
+        return self.cuda_ext.forward(
+            self.W_packed,
+            self._kernel_bias(),
+            self.SZ_packed,
+            kernel_x,
+            self.group_size,
+        )
 
 
 def quantize_model_layers(model: nn.Module, group_size: int, linear_cls=QuantizedLinear4bit, **linear_kwargs):
