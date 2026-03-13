@@ -14,7 +14,6 @@ It also includes:
 ## Variant Names
 
 - `Regular BF16`: the baseline Hugging Face model with no quantization.
-- `Repo Python W4A16`: this repo's quantized path that dequantizes weights in Python during `forward()`.
 - `Repo CUDA Kernel W4A16`: this repo's quantized path using the local CUDA extension in [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu).
 - `LMDeploy AWQ`: LMDeploy's own AWQ implementation, benchmarked only for speed when you provide an LMDeploy-compatible model path.
 
@@ -54,7 +53,6 @@ It also includes:
 `forward_pass_benchmark.py` benchmarks:
 
 - `Regular BF16`: baseline `nn.Linear` / baseline full model
-- `Repo Python W4A16`: this repo's Python dequantization path
 - `Repo CUDA Kernel W4A16`: this repo's local CUDA kernel path
 - optional `LMDeploy AWQ`: an LMDeploy AWQ model path, speed only, not perplexity
 
@@ -96,27 +94,24 @@ From the latest smoke run in [benchmark_run.log](/workspace/W4A16/benchmark_run.
 The plot is meant to answer one question quickly:
 
 - `Regular BF16` is the baseline to beat.
-- `Repo Python W4A16` shows the cost of dequantizing in Python every forward pass.
 - `Repo CUDA Kernel W4A16` shows what improves once the heavy part moves into the local CUDA kernel.
 - `LMDeploy AWQ`, when provided, is an external reference point for speed only.
 
 ### Single Linear Layer
 
 - `Regular BF16`: `0.059 ms`
-- `Repo Python W4A16`: `1.479 ms`
-- `Repo CUDA Kernel W4A16`: `0.274 ms`
+- `Repo CUDA Kernel W4A16`: `0.272 ms`
 
 ### Full Model, One Decode Token
 
-- `Regular BF16`: `36.558 ms`
-- `Repo Python W4A16`: `772.200 ms`
-- `Repo CUDA Kernel W4A16`: `109.108 ms`
+- `Regular BF16`: `35.156 ms`
+- `Repo CUDA Kernel W4A16`: `108.476 ms`
 
 These numbers show the intended comparison clearly:
 
-- the pure Python dequant path is the main bottleneck
-- this repo's CUDA kernel is much faster than this repo's Python W4A16 path
-- on the current implementation, `Regular BF16` is still faster than both quantized paths
+- the repo-local CUDA kernel path is still slower than the regular BF16 baseline in the current end-to-end benchmark
+- the important question is now isolated kernel speed versus full-model integration cost
+- [explanation.md](/workspace/W4A16/explanation.md) explains why `previous_benchmarking.py` can plausibly suggest a faster kernel while the repo benchmark still comes out slower
 
 ## LMDeploy Comparison
 
@@ -144,6 +139,8 @@ Notes:
 - [quantization.py](/workspace/W4A16/quantization.py): quantization helpers and quantized linear modules
 - [sanity_checks.py](/workspace/W4A16/sanity_checks.py): forward-output comparison helper
 - [forward_pass_benchmark.py](/workspace/W4A16/forward_pass_benchmark.py): speed benchmark entrypoint
+- [previous_benchmarking.py](/workspace/W4A16/previous_benchmarking.py): older isolated benchmark script used as a reference point for kernel-vs-BF16 intuition
+- [explanation.md](/workspace/W4A16/explanation.md): why the isolated kernel result can look faster while the repo full-model benchmark stays slower
 - [w4a16_cuda.cu](/workspace/W4A16/w4a16_cuda.cu): CUDA extension source
 
 ## What This README Does Not Claim

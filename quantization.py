@@ -224,17 +224,21 @@ class CudaKernelQuantizedLinear4bit(QuantizedLinear4bit):
             qmod.bias.data.copy_(linear_module.bias.data.to(torch.bfloat16))
         return qmod
 
+    def _kernel_input(self, x: torch.Tensor) -> torch.Tensor:
+        return x.reshape(-1, self.in_features).transpose(0, 1).contiguous().to(torch.bfloat16)
+
+    def _kernel_bias(self) -> torch.Tensor:
+        return self.bias if self.bias is not None else self._zero_bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not x.is_cuda:
             return super().forward(x)
 
-        flat_x = x.reshape(-1, self.in_features).transpose(0, 1).contiguous().to(torch.bfloat16)
-        bias = self.bias if self.bias is not None else self._zero_bias.to(x.device)
         out = self.cuda_ext.forward(
-            self.W_packed.to(x.device),
-            bias.to(x.device),
-            self.SZ_packed.to(x.device),
-            flat_x,
+            self.W_packed,
+            self._kernel_bias(),
+            self.SZ_packed,
+            self._kernel_input(x),
             self.group_size,
         )
         return out.transpose(0, 1).contiguous().view(*x.shape[:-1], self.out_features)

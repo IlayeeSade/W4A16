@@ -23,7 +23,6 @@ from transformers import AutoModelForCausalLM
 
 from quantization import (
     CudaKernelQuantizedLinear4bit,
-    QuantizedLinear4bit,
     load_w4a16_cuda_extension,
     quantize_model_layers,
 )
@@ -31,7 +30,6 @@ from quantization import (
 
 VARIANT_LABELS = {
     "regular_bf16": "Regular BF16",
-    "repo_python_w4a16": "Repo Python W4A16",
     "repo_cuda_kernel_w4a16": "Repo CUDA Kernel W4A16",
     "lmdeploy_awq_pytorch": "LMDeploy AWQ (PyTorch)",
     "lmdeploy_awq_turbomind": "LMDeploy AWQ (TurboMind)",
@@ -81,7 +79,6 @@ def bench_single_linear(
     print("=" * 72)
 
     regular = nn.Linear(in_features, out_features, bias=True).to(torch.bfloat16).to(device).eval()
-    python_quant = QuantizedLinear4bit.from_linear(copy.deepcopy(regular).cpu(), group_size).to(device).eval()
     cuda_quant = None
     if cuda_ext is not None and device.type == "cuda":
         cuda_quant = CudaKernelQuantizedLinear4bit.from_linear(
@@ -96,9 +93,6 @@ def bench_single_linear(
     with torch.no_grad():
         warmup(lambda: regular(x))
         results["regular_bf16"] = measure_ms(lambda: regular(x), n_runs)
-
-        warmup(lambda: python_quant(x))
-        results["repo_python_w4a16"] = measure_ms(lambda: python_quant(x), n_runs)
 
         if cuda_quant is not None:
             warmup(lambda: cuda_quant(x))
@@ -179,9 +173,7 @@ def bench_full_model(
     vocab_size = base_model.config.vocab_size
     print("Model loaded.")
 
-    print("Quantizing Python W4A16 model ...")
     regular_model = base_model
-    _, python_quant_model = quantize_model_layers(base_model, group_size)
 
     cuda_quant_model = None
     if cuda_ext is not None and device.type == "cuda":
@@ -198,11 +190,6 @@ def bench_full_model(
 
     print("\nBenchmarking regular model ...")
     results["regular_bf16"] = bench_torch_model_variant(regular_model, input_ids, n_runs, device)
-
-    print("Benchmarking Python W4A16 model ...")
-    results["repo_python_w4a16"] = bench_torch_model_variant(python_quant_model, input_ids, n_runs, device)
-    del python_quant_model
-    gc.collect()
 
     if cuda_quant_model is not None:
         print("Benchmarking CUDA-kernel W4A16 model ...")
@@ -275,7 +262,7 @@ def write_plot(path: str | None, payload: dict):
     draw.text((40, 24), "W4A16 Forward Benchmark", fill="#111111", font=font)
     draw.text(
         (40, 48),
-        "Regular BF16 vs this repo's Python W4A16 vs this repo's CUDA-kernel W4A16"
+        "Regular BF16 vs this repo's CUDA-kernel W4A16"
         + (" vs LMDeploy AWQ" if any(k.startswith("lmdeploy_awq") for k in payload["full_model_results_ms"]) else ""),
         fill="#444444",
         font=font,
@@ -286,7 +273,6 @@ def write_plot(path: str | None, payload: dict):
 
     footer = (
         "Regular BF16 = baseline Hugging Face model. "
-        "Repo Python W4A16 = dequantize-on-the-fly Python path. "
         "Repo CUDA Kernel W4A16 = local CUDA extension path. "
         "LMDeploy AWQ = optional external speed-only comparison."
     )
@@ -368,14 +354,13 @@ def main():
         "full_model_results_ms": {key: {"mean": value[0], "std": value[1]} for key, value in model_results.items()},
         "variant_descriptions": {
             "regular_bf16": "Unquantized Hugging Face model in BF16.",
-            "repo_python_w4a16": "This repo's W4A16 path using Python dequantization in forward().",
             "repo_cuda_kernel_w4a16": "This repo's W4A16 path using the local CUDA kernel from w4a16_cuda.cu.",
             "lmdeploy_awq_pytorch": "LMDeploy AWQ model using LMDeploy's PyTorch backend.",
             "lmdeploy_awq_turbomind": "LMDeploy AWQ model using LMDeploy's TurboMind backend.",
         },
         "notes": [
             "LMDeploy comparison is speed-only and measures end-to-end generation latency for max_new_tokens=1.",
-            "Regular BF16 / repo Python W4A16 / repo CUDA-kernel W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1].",
+            "Regular BF16 / repo CUDA-kernel W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1].",
         ],
     }
     write_results(args.results_json, payload)
