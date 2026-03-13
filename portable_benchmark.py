@@ -447,18 +447,25 @@ def main():
             raise ValueError("--model-checkpoint is required for full-model mode")
         if repo_cuda_ext is None:
             raise RuntimeError("Full-model mode requires CUDA and the repo kernel extension")
-        model_results = run_full_model_benchmark(
-            model_checkpoint=args.model_checkpoint,
-            hf_token=args.hf_token,
-            group_size=args.group_size,
-            n_runs=args.model_runs,
-            device=device,
-            dense_dtype=selected_dtype,
-            repo_cuda_ext=repo_cuda_ext,
-            enable_direct_kernel=args.enable_direct_kernel,
-        )
-        payload["full_model_results_ms"] = {name: metric_to_json(metric) for name, metric in model_results.items()}
-        print_model_summary(model_results)
+        try:
+            model_results = run_full_model_benchmark(
+                model_checkpoint=args.model_checkpoint,
+                hf_token=args.hf_token,
+                group_size=args.group_size,
+                n_runs=args.model_runs,
+                device=device,
+                dense_dtype=selected_dtype,
+                repo_cuda_ext=repo_cuda_ext,
+                enable_direct_kernel=args.enable_direct_kernel,
+            )
+            payload["full_model_results_ms"] = {name: metric_to_json(metric) for name, metric in model_results.items()}
+            print_model_summary(model_results)
+        except Exception as exc:
+            payload["full_model_error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            print(f"[WARN] Full-model benchmark failed: {type(exc).__name__}: {exc}")
 
     results_path.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Wrote {results_path}")

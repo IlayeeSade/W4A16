@@ -715,19 +715,29 @@ def main():
         direct_cuda_ext=direct_cuda_ext,
     )
 
-    model_results, profiled_layer = bench_full_model(
-        model_checkpoint=args.model_checkpoint,
-        hf_token=args.hf_token,
-        group_size=args.group_size,
-        n_runs=args.model_runs,
-        device=device,
-        cuda_ext=cuda_ext,
-        direct_cuda_ext=direct_cuda_ext,
-        lmdeploy_model_path=args.lmdeploy_model_path,
-        lmdeploy_backend=args.lmdeploy_backend,
-        profile_layer_name=args.profile_layer_name,
-        profile_layer_runs=args.profile_layer_runs,
-    )
+    model_results = {}
+    profiled_layer = None
+    full_model_error = None
+    try:
+        model_results, profiled_layer = bench_full_model(
+            model_checkpoint=args.model_checkpoint,
+            hf_token=args.hf_token,
+            group_size=args.group_size,
+            n_runs=args.model_runs,
+            device=device,
+            cuda_ext=cuda_ext,
+            direct_cuda_ext=direct_cuda_ext,
+            lmdeploy_model_path=args.lmdeploy_model_path,
+            lmdeploy_backend=args.lmdeploy_backend,
+            profile_layer_name=args.profile_layer_name,
+            profile_layer_runs=args.profile_layer_runs,
+        )
+    except Exception as exc:
+        full_model_error = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        print(f"[WARN] Full-model benchmark failed: {type(exc).__name__}: {exc}")
 
     payload = {
         "model_checkpoint": args.model_checkpoint,
@@ -757,6 +767,8 @@ def main():
                 key: breakdown_to_json(value) for key, value in profiled_layer["variants"].items()
             },
         }
+    if full_model_error is not None:
+        payload["full_model_error"] = full_model_error
     if baseline_payload is not None:
         payload["comparison_to_previous"] = {
             "baseline_path": baseline_path,
