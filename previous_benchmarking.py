@@ -11,7 +11,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 # 1. Load Extensions
 w4a16_cuda_ext = load(
-    name="w4a16_cuda_ext",
+    name="w4a16_cuda_ext_v7",
     sources=[os.path.join(this_dir, "w4a16_cuda.cu")],
     extra_cuda_cflags=["-O3", "-allow-unsupported-compiler"],
     verbose=True,
@@ -92,9 +92,9 @@ def unpack_rows_4(W_packed: torch.Tensor) -> torch.Tensor:
 def raw_cuda_w4a16(W, b, SZ, group_size, activations):
     # CUDA wrapper expects:
     #   W  : [OF // 4, IF] uint16
-    #   b  : [OF] float16
-    #   SZ : [IF // group_size, 2 * OF] float16
-    #   activations : [IF, 1] float16
+    #   b  : [OF] bfloat16
+    #   SZ : [IF // group_size, 2 * OF] bfloat16
+    #   activations : [IF, 1] bfloat16
     return w4a16_cuda_ext.forward(
         W.contiguous(),
         b.contiguous(),
@@ -110,7 +110,7 @@ def raw_cuda_w4a16(W, b, SZ, group_size, activations):
 def dequantize_layer(W_q, S, Z, group_size):
     N, K = W_q.shape
     W_q_reshaped = W_q.view(N, K // group_size, group_size)
-    W_deq = (W_q_reshaped.to(torch.float16) - Z.unsqueeze(-1)) * S.unsqueeze(-1)
+    W_deq = (W_q_reshaped.to(S.dtype) - Z.unsqueeze(-1)) * S.unsqueeze(-1)
     return W_deq.view(N, K)
 
 
@@ -135,7 +135,7 @@ def interleave_transposed_s_z(S: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
       [s0, z0, s1, z1, s2, z2, ...]
     """
     assert S.shape == Z.shape
-    assert S.dtype == torch.float16 and Z.dtype == torch.float16
+    assert S.dtype == Z.dtype
     assert S.is_contiguous() and Z.is_contiguous()
 
     OF_local, G_local = S.shape
@@ -143,7 +143,7 @@ def interleave_transposed_s_z(S: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
     S_t = S.t().contiguous()  # [G, OF]
     Z_t = Z.t().contiguous()  # [G, OF]
 
-    SZ = torch.empty((G_local, 2 * OF_local), device=S.device, dtype=torch.float16)
+    SZ = torch.empty((G_local, 2 * OF_local), device=S.device, dtype=S.dtype)
     SZ[:, 0::2] = S_t
     SZ[:, 1::2] = Z_t
     return SZ.contiguous()
@@ -173,28 +173,34 @@ def plotting_and_benchmarking():
         # Raw CUDA uses 4-row packing
         W_packed_raw = pack_rows_4(W_q)  # [OF // 4, IF], uint16
 
-        b = torch.randn((OF,), device=DEVICE, dtype=torch.float16).contiguous()
+        b_fp16 = torch.randn((OF,), device=DEVICE, dtype=torch.float16).contiguous()
         G = IF // group_size
 
-        S = torch.ones((OF, G), device=DEVICE, dtype=torch.float16).contiguous()
-        Z = torch.randint(0, 16, (OF, G), device=DEVICE, dtype=torch.float16).contiguous()
+        S_fp16 = torch.ones((OF, G), device=DEVICE, dtype=torch.float16).contiguous()
+        Z_fp16 = torch.randint(0, 16, (OF, G), device=DEVICE, dtype=torch.float16).contiguous()
 
-        SZ = interleave_transposed_s_z(S, Z)
+        b_bf16 = b_fp16.to(torch.bfloat16).contiguous()
+        S_bf16 = S_fp16.to(torch.bfloat16).contiguous()
+        Z_bf16 = Z_fp16.to(torch.bfloat16).contiguous()
 
-        act = torch.randn((IF, B), device=DEVICE, dtype=torch.float16).contiguous()
+        SZ_bf16 = interleave_transposed_s_z(S_bf16, Z_bf16)
+
+        act_fp16 = torch.randn((IF, B), device=DEVICE, dtype=torch.float16).contiguous()
+        act_bf16 = act_fp16.to(torch.bfloat16).contiguous()
         W_ref_fp16 = torch.randn((OF, IF), device=DEVICE, dtype=torch.float16).contiguous()
+        W_ref_bf16 = W_ref_fp16.to(torch.bfloat16).contiguous()
 
         # Sanity checks for the CUDA wrapper contract
         assert W_packed_raw.shape == (OF // 4, IF)
-        assert b.shape == (OF,)
-        assert SZ.shape == (IF // group_size, 2 * OF)
-        assert act.shape == (IF, 1)
+        assert b_bf16.shape == (OF,)
+        assert SZ_bf16.shape == (IF // group_size, 2 * OF)
+        assert act_bf16.shape == (IF, 1)
 
         # ----------------------------------------------------------------------
         # Correctness check: raw CUDA vs Torch reference for the 4-row packing
         # ----------------------------------------------------------------------
-        torch_ref_raw = torch_w4a16_from_packed4(W_packed_raw, b, S, Z, group_size, act)
-        cuda_out = raw_cuda_w4a16(W_packed_raw, b, SZ, group_size, act)
+        torch_ref_raw = torch_w4a16_from_packed4(W_packed_raw, b_bf16, S_bf16, Z_bf16, group_size, act_bf16)
+        cuda_out = raw_cuda_w4a16(W_packed_raw, b_bf16, SZ_bf16, group_size, act_bf16)
 
         max_abs_err = (cuda_out - torch_ref_raw).abs().max().item()
         mean_abs_err = (cuda_out - torch_ref_raw).abs().mean().item()
@@ -216,7 +222,7 @@ def plotting_and_benchmarking():
             0, 255, (OF, IF // 2), device=DEVICE, dtype=torch.uint8
         ).contiguous()
 
-        Z_int = Z.to(torch.int32)
+        Z_int = Z_fp16.to(torch.int32)
         Z_awq_int32 = torch.zeros(
             (OF, (IF // group_size) // PACK_FACTOR),
             device=DEVICE,
@@ -227,10 +233,10 @@ def plotting_and_benchmarking():
             Z_awq_int32 |= (Z_int[:, i::PACK_FACTOR] & 0xF) << (i * 4)
 
         Z_awq = Z_awq_int32.view(torch.uint8).contiguous()
-        S_awq = S.clone().contiguous()
+        S_awq = S_fp16.clone().contiguous()
 
         # Transpose activations to [B, IF] for AWQ
-        act_awq = act.t().contiguous()
+        act_awq = act_fp16.t().contiguous()
 
         # ----------------------------------------------------------------------
         # Benchmarking
@@ -252,8 +258,9 @@ def plotting_and_benchmarking():
 
             return start.elapsed_time(end) / iters
 
-        torch_ms = bench(lambda: torch.matmul(W_ref_fp16, act) + b[:, None])
-        cuda_ms = bench(lambda: raw_cuda_w4a16(W_packed_raw, b, SZ, group_size, act))
+        torch_bf16_ms = bench(lambda: torch.matmul(W_ref_bf16, act_bf16) + b_bf16[:, None])
+        torch_fp16_ms = bench(lambda: torch.matmul(W_ref_fp16, act_fp16) + b_fp16[:, None])
+        cuda_ms = bench(lambda: raw_cuda_w4a16(W_packed_raw, b_bf16, SZ_bf16, group_size, act_bf16))
 
         try:
             awq_ms = bench(
@@ -265,9 +272,22 @@ def plotting_and_benchmarking():
             print(f"AWQ Error: {e}")
             awq_ms = float("nan")
 
+        print(
+            "timings | "
+            f"torch_bf16={torch_bf16_ms:.4f} ms, "
+            f"torch_fp16={torch_fp16_ms:.4f} ms, "
+            f"raw_cuda_bf16={cuda_ms:.4f} ms, "
+            f"awq_fp16={awq_ms:.4f} ms"
+        )
+
         flops = 2.0 * OF * IF * B
 
-        for name, ms in [("torch", torch_ms), ("raw_cuda", cuda_ms), ("awq", awq_ms)]:
+        for name, ms in [
+            ("torch_bf16", torch_bf16_ms),
+            ("torch_fp16", torch_fp16_ms),
+            ("raw_cuda_bf16", cuda_ms),
+            ("awq_fp16", awq_ms),
+        ]:
             if not np.isnan(ms):
                 records.append(
                     {
@@ -285,7 +305,12 @@ def plotting_and_benchmarking():
     pivot_df = df.pivot(index="OF", columns="provider", values="tflops")
 
     fig, ax = plt.subplots(figsize=(12, 7))
-    colors = {"torch": "gray", "raw_cuda": "tab:green", "awq": "tab:red"}
+    colors = {
+        "torch_bf16": "gray",
+        "torch_fp16": "tab:blue",
+        "raw_cuda_bf16": "tab:green",
+        "awq_fp16": "tab:red",
+    }
 
     for provider in df.provider.unique():
         sub = df[df.provider == provider]
@@ -297,10 +322,10 @@ def plotting_and_benchmarking():
             color=colors.get(provider),
         )
 
-        if provider != "torch":
+        if provider != "torch_bf16":
             for of_val in sub.OF:
                 try:
-                    speedup = pivot_df.loc[of_val, provider] / pivot_df.loc[of_val, "torch"]
+                    speedup = pivot_df.loc[of_val, provider] / pivot_df.loc[of_val, "torch_bf16"]
                     ax.annotate(
                         f"{speedup:.2f}x",
                         xy=(of_val, pivot_df.loc[of_val, provider]),

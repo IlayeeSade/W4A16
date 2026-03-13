@@ -59,6 +59,43 @@ It also includes:
 - `Repo Direct-Input CUDA W4A16`: same kernel, but with activation layout preparation moved into the extension wrapper
 - optional `LMDeploy AWQ`: an LMDeploy AWQ model path, speed only, not perplexity
 
+It now also reports:
+
+- `layer_breakdown_ms`: separate timing for input preparation, raw CUDA extension time, output post-processing, and total single-layer latency
+- optional `profiled_model_layer_ms`: one model-layer breakdown using the exact hidden-state shape observed during decode
+- environment metadata such as GPU name, CUDA capability, Torch version, timestamp, and kernel accumulation dtype
+
+## Portable Benchmarking
+
+Use [portable_benchmark.py](/workspace/W4A16/portable_benchmark.py) when you want one script that is easy to copy to another CUDA machine and run there.
+
+Key points:
+
+- synthetic mode benchmarks dense baseline vs repo kernel vs direct-input repo kernel
+- full-model mode benchmarks a regular Hugging Face model against the repo-kernel quantized model
+- dense baselines use BF16 when available and fall back to FP16 otherwise
+- the repo CUDA kernel still uses BF16 tensors internally because that is the current extension contract
+
+Examples:
+
+```bash
+python /workspace/W4A16/portable_benchmark.py \
+  --mode synthetic \
+  --results-json portable_results.json
+```
+
+```bash
+python /workspace/W4A16/portable_benchmark.py \
+  --model-checkpoint meta-llama/Meta-Llama-3.1-8B \
+  --hf-token "$HF_TOKEN" \
+  --results-json portable_model_results.json
+```
+
+Why this helps on an RTX 3070:
+
+- dense baselines usually want FP16 there unless BF16 is explicitly reported as supported
+- the script records the chosen dense dtype and the repo-kernel dtype in JSON so you can tell exactly what ran
+
 ## Known Runtime Constraint
 
 The Llama 8B checkpoint does work on this machine, but it does **not** fit if Hugging Face caches into `/workspace/.hf_home` on the small overlay filesystem.

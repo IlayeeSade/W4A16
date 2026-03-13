@@ -40,16 +40,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
     const uint4* W_vec = reinterpret_cast<const uint4*>(W_packed);
     int IF_vec = IF >> 3; // IF / 8
 
-    // FIX 2: Use double-precision accumulation instead of float
-    // PROBLEM: Float32 precision loss with large accumulations (IF=4096)
-    // Accumulating 4096 float values loses precision after ~1000 additions
-    // With OF=8192 rows, max_err can exceed tolerance
-    // SOLUTION: Use double (float64) for accumulation, convert to BF16 at output
-    // This maintains full precision during summation, only loses precision at final conversion
-    double partial_acc_0 = 0.0;
-    double partial_acc_1 = 0.0;
-    double partial_acc_2 = 0.0;
-    double partial_acc_3 = 0.0;
+    float partial_acc_0 = 0.0f;
+    float partial_acc_1 = 0.0f;
+    float partial_acc_2 = 0.0f;
+    float partial_acc_3 = 0.0f;
 
     for (int k_base = 0; k_base < IF_vec; k_base += BLOCK_DIM_X) {
         int k_vec = k_base + tx;
@@ -100,10 +94,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
                     uint8_t w2 = (w_packed_val >>  8) & 0x0F;
                     uint8_t w3 = (w_packed_val >> 12) & 0x0F;
 
-                    partial_acc_0 += (double)(static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (double)(static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (double)(static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (double)(static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
+                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
+                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
+                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
+                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
                 }
             }
 
@@ -135,10 +129,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
                     uint8_t w2 = (w_packed_val >>  8) & 0x0F;
                     uint8_t w3 = (w_packed_val >> 12) & 0x0F;
 
-                    partial_acc_0 += (double)(static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (double)(static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (double)(static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (double)(static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
+                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
+                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
+                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
+                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
                 }
             }
 
@@ -170,10 +164,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
                     uint8_t w2 = (w_packed_val >>  8) & 0x0F;
                     uint8_t w3 = (w_packed_val >> 12) & 0x0F;
 
-                    partial_acc_0 += (double)(static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (double)(static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (double)(static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (double)(static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
+                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
+                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
+                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
+                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
                 }
             }
 
@@ -205,10 +199,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
                     uint8_t w2 = (w_packed_val >>  8) & 0x0F;
                     uint8_t w3 = (w_packed_val >> 12) & 0x0F;
 
-                    partial_acc_0 += (double)(static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
-                    partial_acc_1 += (double)(static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
-                    partial_acc_2 += (double)(static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
-                    partial_acc_3 += (double)(static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
+                    partial_acc_0 += (static_cast<float>(w0) - z_val_0) * s_val_0 * act_val;
+                    partial_acc_1 += (static_cast<float>(w1) - z_val_1) * s_val_1 * act_val;
+                    partial_acc_2 += (static_cast<float>(w2) - z_val_2) * s_val_2 * act_val;
+                    partial_acc_3 += (static_cast<float>(w3) - z_val_3) * s_val_3 * act_val;
                 }
             }
         }
@@ -222,7 +216,7 @@ __global__ void w4a16_gemv_vectorized_kernel(
         partial_acc_3 += __shfl_down_sync(0xffffffff, partial_acc_3, offset);
     }
 
-    __shared__ double warp_sums[BLOCK_DIM_Y][WARPS_PER_TX][4];
+    __shared__ float warp_sums[BLOCK_DIM_Y][WARPS_PER_TX][4];
 
     if (lane_id == 0) {
         warp_sums[ty][warp_id_x][0] = partial_acc_0;
@@ -234,10 +228,10 @@ __global__ void w4a16_gemv_vectorized_kernel(
     __syncthreads();
 
     if (warp_id_x == 0) {
-        double block_acc_0 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][0] : 0.0;
-        double block_acc_1 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][1] : 0.0;
-        double block_acc_2 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][2] : 0.0;
-        double block_acc_3 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][3] : 0.0;
+        float block_acc_0 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][0] : 0.0f;
+        float block_acc_1 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][1] : 0.0f;
+        float block_acc_2 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][2] : 0.0f;
+        float block_acc_3 = (lane_id < WARPS_PER_TX) ? warp_sums[ty][lane_id][3] : 0.0f;
 
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {

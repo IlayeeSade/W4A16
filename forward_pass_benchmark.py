@@ -4,8 +4,11 @@ Forward-pass speed benchmark for regular vs W4A16 model variants.
 This script benchmarks:
 1. A single linear layer.
 2. A full causal LM forward pass for one decode token.
-3. Optionally, an LMDeploy AWQ model for speed-only generation latency.
+3. Optionally, one model-layer profile using real decode activations.
+4. Optionally, an LMDeploy AWQ model for speed-only generation latency.
 """
+
+from __future__ import annotations
 
 import argparse
 import copy
@@ -14,12 +17,12 @@ import json
 import os
 import statistics
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from PIL import Image, ImageDraw, ImageFont
-from transformers import AutoModelForCausalLM
 
 from quantization import (
     CudaDirectQuantizedLinear4bit,
@@ -37,6 +40,7 @@ VARIANT_LABELS = {
     "lmdeploy_awq_pytorch": "LMDeploy AWQ (PyTorch)",
     "lmdeploy_awq_turbomind": "LMDeploy AWQ (TurboMind)",
 }
+ZERO_METRIC = (0.0, 0.0)
 
 
 def sync():
@@ -44,10 +48,12 @@ def sync():
         torch.cuda.synchronize()
 
 
+
 def warmup(fn, n: int = 5):
     for _ in range(n):
         fn()
     sync()
+
 
 
 def measure_ms(fn, n: int) -> tuple[float, float]:
@@ -61,12 +67,233 @@ def measure_ms(fn, n: int) -> tuple[float, float]:
     return statistics.mean(times), statistics.stdev(times) if len(times) > 1 else 0.0
 
 
+
+def metric_to_json(metric: tuple[float, float]) -> dict[str, float]:
+    return {"mean": metric[0], "std": metric[1]}
+
+
+
+def breakdown_to_json(breakdown: dict[str, tuple[float, float]]) -> dict[str, dict[str, float]]:
+    return {name: metric_to_json(metric) for name, metric in breakdown.items()}
+
+
+
+def load_json(path: str | Path | None) -> dict | None:
+    if not path:
+        return None
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+
+def resolve_baseline_payload(
+    explicit_path: str | None,
+    results_path: str | None,
+    default_name: str,
+) -> tuple[str | None, dict | None]:
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    if results_path:
+        candidates.append(Path(results_path))
+    candidates.append(Path(__file__).with_name(default_name))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        payload = load_json(candidate)
+        if payload is not None:
+            return str(candidate), payload
+    return None, None
+
+
+
+def compare_result_sections(
+    current: dict[str, tuple[float, float]],
+    baseline: dict[str, dict[str, float]] | None,
+) -> dict[str, dict[str, float]]:
+    if not baseline:
+        return {}
+
+    comparison = {}
+    for name, metric in current.items():
+        baseline_metric = baseline.get(name)
+        if not baseline_metric:
+            continue
+        baseline_mean = baseline_metric.get("mean")
+        if baseline_mean is None:
+            continue
+        current_mean = metric[0]
+        comparison[name] = {
+            "current_mean": current_mean,
+            "baseline_mean": baseline_mean,
+            "delta_ms": current_mean - baseline_mean,
+            "ratio_vs_baseline": (current_mean / baseline_mean) if baseline_mean else 0.0,
+            "speedup_vs_baseline": (baseline_mean / current_mean) if current_mean else 0.0,
+        }
+    return comparison
+
+
+
+def get_env_metadata(device: torch.device) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "kernel_accumulation_dtype": "fp32",
+        "benchmark_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "torch_version": torch.__version__,
+        "device": str(device),
+    }
+    if torch.cuda.is_available() and device.type == "cuda":
+        metadata["gpu_name"] = torch.cuda.get_device_name(device)
+        capability = torch.cuda.get_device_capability(device)
+        metadata["cuda_capability"] = f"{capability[0]}.{capability[1]}"
+    else:
+        metadata["gpu_name"] = None
+        metadata["cuda_capability"] = None
+    return metadata
+
+
+
 def unload_model(model: nn.Module):
     model.cpu()
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+
+def load_auto_model_for_causal_lm():
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM
+
+
+
+def get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
+    modules = dict(model.named_modules())
+    if module_name not in modules:
+        raise KeyError(f"Module '{module_name}' not found")
+    return modules[module_name]
+
+
+
+def pick_profile_layer_name(model: nn.Module, requested_name: str) -> str:
+    if requested_name != "auto":
+        get_module_by_name(model, requested_name)
+        return requested_name
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            return name
+    raise ValueError("Could not auto-select a linear layer to profile")
+
+
+
+def capture_layer_input(
+    model: nn.Module,
+    layer_name: str,
+    input_ids: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    model.to(device).eval()
+    layer = get_module_by_name(model, layer_name)
+    captured: dict[str, torch.Tensor] = {}
+
+    def hook(_module, args):
+        if args:
+            captured["x"] = args[0].detach().clone()
+
+    handle = layer.register_forward_pre_hook(hook)
+    try:
+        with torch.no_grad():
+            model(input_ids=input_ids.to(device), use_cache=False)
+    finally:
+        handle.remove()
+
+    if "x" not in captured:
+        raise RuntimeError(f"Did not capture inputs for layer '{layer_name}'")
+    return captured["x"]
+
+
+
+def bench_regular_linear_breakdown(module: nn.Module, x: torch.Tensor, n_runs: int):
+    warmup(lambda: module(x))
+    end_to_end = measure_ms(lambda: module(x), n_runs)
+    return {
+        "input_prep": ZERO_METRIC,
+        "kernel_call": end_to_end,
+        "output_postprocess": ZERO_METRIC,
+        "end_to_end": end_to_end,
+    }
+
+
+
+def bench_repo_cuda_breakdown(module: CudaKernelQuantizedLinear4bit, x: torch.Tensor, n_runs: int):
+    prep_fn = lambda: module._kernel_input(x)
+    warmup(prep_fn)
+    input_prep = measure_ms(prep_fn, n_runs)
+    prepared_input = prep_fn()
+
+    kernel_fn = lambda: module.cuda_ext.forward(
+        module.W_packed,
+        module._kernel_bias(),
+        module.SZ_packed,
+        prepared_input,
+        module.group_size,
+    )
+    warmup(kernel_fn)
+    kernel_call = measure_ms(kernel_fn, n_runs)
+    raw_out = kernel_fn()
+
+    post_fn = lambda: raw_out.transpose(0, 1).contiguous().view(*x.shape[:-1], module.out_features)
+    warmup(post_fn)
+    output_postprocess = measure_ms(post_fn, n_runs)
+
+    warmup(lambda: module(x))
+    end_to_end = measure_ms(lambda: module(x), n_runs)
+
+    return {
+        "input_prep": input_prep,
+        "kernel_call": kernel_call,
+        "output_postprocess": output_postprocess,
+        "end_to_end": end_to_end,
+    }
+
+
+
+def bench_direct_cuda_breakdown(module: CudaDirectQuantizedLinear4bit, x: torch.Tensor, n_runs: int):
+    prep_fn = lambda: x if x.dtype == torch.bfloat16 and x.is_contiguous() else x.to(torch.bfloat16).contiguous()
+    warmup(prep_fn)
+    input_prep = measure_ms(prep_fn, n_runs)
+    prepared_input = prep_fn()
+
+    kernel_fn = lambda: module.cuda_ext.forward(
+        module.W_packed,
+        module._kernel_bias(),
+        module.SZ_packed,
+        prepared_input,
+        module.group_size,
+    )
+    warmup(kernel_fn)
+    kernel_call = measure_ms(kernel_fn, n_runs)
+
+    warmup(lambda: module(x))
+    end_to_end = measure_ms(lambda: module(x), n_runs)
+
+    return {
+        "input_prep": input_prep,
+        "kernel_call": kernel_call,
+        "output_postprocess": ZERO_METRIC,
+        "end_to_end": end_to_end,
+    }
+
 
 
 def bench_single_linear(
@@ -99,22 +326,25 @@ def bench_single_linear(
         ).to(device).eval()
 
     x = torch.randn(1, 1, in_features, dtype=torch.bfloat16, device=device)
-    results = {}
+    results: dict[str, tuple[float, float]] = {}
+    breakdowns: dict[str, dict[str, tuple[float, float]]] = {}
 
     with torch.no_grad():
-        warmup(lambda: regular(x))
-        results["regular_bf16"] = measure_ms(lambda: regular(x), n_runs)
+        breakdowns["regular_bf16"] = bench_regular_linear_breakdown(regular, x, n_runs)
+        results["regular_bf16"] = breakdowns["regular_bf16"]["end_to_end"]
 
         if cuda_quant is not None:
-            warmup(lambda: cuda_quant(x))
-            results["repo_cuda_kernel_w4a16"] = measure_ms(lambda: cuda_quant(x), n_runs)
+            breakdowns["repo_cuda_kernel_w4a16"] = bench_repo_cuda_breakdown(cuda_quant, x, n_runs)
+            results["repo_cuda_kernel_w4a16"] = breakdowns["repo_cuda_kernel_w4a16"]["end_to_end"]
 
         if direct_cuda_quant is not None:
-            warmup(lambda: direct_cuda_quant(x))
-            results["repo_direct_cuda_w4a16"] = measure_ms(lambda: direct_cuda_quant(x), n_runs)
+            breakdowns["repo_direct_cuda_w4a16"] = bench_direct_cuda_breakdown(direct_cuda_quant, x, n_runs)
+            results["repo_direct_cuda_w4a16"] = breakdowns["repo_direct_cuda_w4a16"]["end_to_end"]
 
     print_results_table(results)
-    return results
+    print_breakdown_table(breakdowns)
+    return results, breakdowns
+
 
 
 def bench_torch_model_variant(model: nn.Module, input_ids: torch.Tensor, n_runs: int, device: torch.device):
@@ -128,6 +358,7 @@ def bench_torch_model_variant(model: nn.Module, input_ids: torch.Tensor, n_runs:
         torch.cuda.empty_cache()
     gc.collect()
     return result
+
 
 
 def bench_lmdeploy_variant(
@@ -160,6 +391,56 @@ def bench_lmdeploy_variant(
     return result
 
 
+
+def profile_model_layer(
+    regular_model: nn.Module,
+    input_ids: torch.Tensor,
+    layer_name: str,
+    n_runs: int,
+    device: torch.device,
+    cuda_quant_model: nn.Module | None = None,
+    direct_cuda_quant_model: nn.Module | None = None,
+):
+    print(f"\nProfiling model layer: {layer_name}")
+    captured_x = capture_layer_input(regular_model, layer_name, input_ids, device)
+    regular_layer = get_module_by_name(regular_model, layer_name)
+    results: dict[str, dict[str, tuple[float, float]]] = {
+        "regular_bf16": bench_regular_linear_breakdown(regular_layer, captured_x, n_runs)
+    }
+    input_shape = list(captured_x.shape)
+
+    regular_model.cpu()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    if cuda_quant_model is not None:
+        cuda_quant_model.to(device).eval()
+        quant_layer = get_module_by_name(cuda_quant_model, layer_name)
+        results["repo_cuda_kernel_w4a16"] = bench_repo_cuda_breakdown(quant_layer, captured_x, n_runs)
+        cuda_quant_model.cpu()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    if direct_cuda_quant_model is not None:
+        direct_cuda_quant_model.to(device).eval()
+        direct_layer = get_module_by_name(direct_cuda_quant_model, layer_name)
+        results["repo_direct_cuda_w4a16"] = bench_direct_cuda_breakdown(direct_layer, captured_x, n_runs)
+        direct_cuda_quant_model.cpu()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    print_breakdown_table(results)
+    return {
+        "layer_name": layer_name,
+        "input_shape": input_shape,
+        "variants": results,
+    }
+
+
+
 def bench_full_model(
     model_checkpoint: str,
     hf_token: str | None,
@@ -170,6 +451,8 @@ def bench_full_model(
     direct_cuda_ext=None,
     lmdeploy_model_path: str | None = None,
     lmdeploy_backend: str = "pytorch",
+    profile_layer_name: str | None = None,
+    profile_layer_runs: int = 50,
 ):
     print("\n" + "=" * 72)
     print("BENCHMARK: Full Model Decode Forward")
@@ -180,11 +463,11 @@ def bench_full_model(
     print(f"repetitions : {n_runs}")
 
     print("\nLoading model to CPU ...")
+    AutoModelForCausalLM = load_auto_model_for_causal_lm()
     base_model = AutoModelForCausalLM.from_pretrained(
         model_checkpoint,
         dtype=torch.bfloat16,
         token=hf_token,
-        device_map="cpu",
     )
     vocab_size = base_model.config.vocab_size
     print("Model loaded.")
@@ -213,6 +496,19 @@ def bench_full_model(
 
     input_ids = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
     results = {}
+    layer_profile = None
+
+    if profile_layer_name:
+        resolved_layer_name = pick_profile_layer_name(regular_model, profile_layer_name)
+        layer_profile = profile_model_layer(
+            regular_model=regular_model,
+            input_ids=input_ids,
+            layer_name=resolved_layer_name,
+            n_runs=profile_layer_runs,
+            device=device,
+            cuda_quant_model=cuda_quant_model,
+            direct_cuda_quant_model=direct_cuda_quant_model,
+        )
 
     print("\nBenchmarking regular model ...")
     results["regular_bf16"] = bench_torch_model_variant(regular_model, input_ids, n_runs, device)
@@ -244,7 +540,8 @@ def bench_full_model(
         )
 
     print_results_table(results)
-    return results
+    return results, layer_profile
+
 
 
 def print_results_table(results: dict[str, tuple[float, float]]):
@@ -255,6 +552,25 @@ def print_results_table(results: dict[str, tuple[float, float]]):
         relative = regular_mean / mean_ms if mean_ms else 0.0
         label = VARIANT_LABELS.get(name, name.replace("_", " "))
         print(f"{label:<24} {mean_ms:>12.3f} {std_ms:>12.3f} {relative:>12.2f}x")
+
+
+
+def print_breakdown_table(breakdowns: dict[str, dict[str, tuple[float, float]]]):
+    print(
+        f"\n{'Variant':<24} {'Prep (ms)':>12} {'Kernel (ms)':>12} "
+        f"{'Post (ms)':>12} {'End-to-end':>12}"
+    )
+    print("-" * 76)
+    for name, metrics in breakdowns.items():
+        label = VARIANT_LABELS.get(name, name.replace("_", " "))
+        print(
+            f"{label:<24} "
+            f"{metrics['input_prep'][0]:>12.3f} "
+            f"{metrics['kernel_call'][0]:>12.3f} "
+            f"{metrics['output_postprocess'][0]:>12.3f} "
+            f"{metrics['end_to_end'][0]:>12.3f}"
+        )
+
 
 
 def draw_bar_chart(draw, area, title, result_group):
@@ -288,6 +604,7 @@ def draw_bar_chart(draw, area, title, result_group):
         draw.text((bar_x1 + 8, top), f"{mean:.3f} ms", fill="#111111", font=font)
 
 
+
 def write_plot(path: str | None, payload: dict):
     if not path:
         return
@@ -319,6 +636,7 @@ def write_plot(path: str | None, payload: dict):
     print(f"Wrote benchmark plot to {path}")
 
 
+
 def maybe_load_cuda_extension(enable: bool):
     if not enable:
         return None
@@ -328,6 +646,7 @@ def maybe_load_cuda_extension(enable: bool):
     except Exception as exc:
         print(f"[WARN] CUDA extension unavailable: {type(exc).__name__}: {exc}")
         return None
+
 
 
 def maybe_load_direct_cuda_extension(enable: bool):
@@ -341,11 +660,13 @@ def maybe_load_direct_cuda_extension(enable: bool):
         return None
 
 
+
 def write_results(path: str | None, payload: dict):
     if not path:
         return
     Path(path).write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Wrote benchmark results to {path}")
+
 
 
 def parse_args():
@@ -356,15 +677,19 @@ def parse_args():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--layer-runs", type=int, default=200)
     parser.add_argument("--model-runs", type=int, default=30)
+    parser.add_argument("--profile-layer-runs", type=int, default=50)
     parser.add_argument("--layer-in-features", type=int, default=4096)
     parser.add_argument("--layer-out-features", type=int, default=4096)
     parser.add_argument("--enable-cuda-kernel", action="store_true")
     parser.add_argument("--enable-direct-cuda-kernel", action="store_true")
     parser.add_argument("--lmdeploy-model-path", default=None)
     parser.add_argument("--lmdeploy-backend", choices=["pytorch", "turbomind"], default="pytorch")
+    parser.add_argument("--profile-layer-name", default=None, help="Module name to profile, or 'auto'.")
+    parser.add_argument("--baseline-json", default=None)
     parser.add_argument("--results-json", default=None)
     parser.add_argument("--plot-path", default=None)
     return parser.parse_args()
+
 
 
 def main():
@@ -372,12 +697,15 @@ def main():
     device = torch.device(args.device)
     cuda_ext = maybe_load_cuda_extension(args.enable_cuda_kernel)
     direct_cuda_ext = maybe_load_direct_cuda_extension(args.enable_direct_cuda_kernel)
+    baseline_path, baseline_payload = resolve_baseline_payload(args.baseline_json, args.results_json, "benchmark_results.json")
 
     print(f"Running on: {device}")
     if args.lmdeploy_model_path:
         print(f"LMDeploy comparison enabled: {args.lmdeploy_model_path}")
+    if baseline_path:
+        print(f"Baseline comparison source: {baseline_path}")
 
-    layer_results = bench_single_linear(
+    layer_results, layer_breakdown = bench_single_linear(
         in_features=args.layer_in_features,
         out_features=args.layer_out_features,
         group_size=args.group_size,
@@ -387,7 +715,7 @@ def main():
         direct_cuda_ext=direct_cuda_ext,
     )
 
-    model_results = bench_full_model(
+    model_results, profiled_layer = bench_full_model(
         model_checkpoint=args.model_checkpoint,
         hf_token=args.hf_token,
         group_size=args.group_size,
@@ -397,14 +725,17 @@ def main():
         direct_cuda_ext=direct_cuda_ext,
         lmdeploy_model_path=args.lmdeploy_model_path,
         lmdeploy_backend=args.lmdeploy_backend,
+        profile_layer_name=args.profile_layer_name,
+        profile_layer_runs=args.profile_layer_runs,
     )
 
     payload = {
         "model_checkpoint": args.model_checkpoint,
-        "device": str(device),
+        **get_env_metadata(device),
         "group_size": args.group_size,
-        "layer_results_ms": {key: {"mean": value[0], "std": value[1]} for key, value in layer_results.items()},
-        "full_model_results_ms": {key: {"mean": value[0], "std": value[1]} for key, value in model_results.items()},
+        "layer_results_ms": {key: metric_to_json(value) for key, value in layer_results.items()},
+        "layer_breakdown_ms": {key: breakdown_to_json(value) for key, value in layer_breakdown.items()},
+        "full_model_results_ms": {key: metric_to_json(value) for key, value in model_results.items()},
         "variant_descriptions": {
             "regular_bf16": "Unquantized Hugging Face model in BF16.",
             "repo_cuda_kernel_w4a16": "This repo's W4A16 path using the local CUDA kernel from w4a16_cuda.cu.",
@@ -415,8 +746,24 @@ def main():
         "notes": [
             "LMDeploy comparison is speed-only and measures end-to-end generation latency for max_new_tokens=1.",
             "Regular BF16 / repo CUDA-kernel W4A16 / repo direct-input CUDA W4A16 comparisons measure raw torch forward latency for input_ids shape [1, 1].",
+            "layer_breakdown_ms isolates input preparation, CUDA extension time, and output post-processing for the single-layer benchmark.",
         ],
     }
+    if profiled_layer is not None:
+        payload["profiled_model_layer_ms"] = {
+            "layer_name": profiled_layer["layer_name"],
+            "input_shape": profiled_layer["input_shape"],
+            "variants": {
+                key: breakdown_to_json(value) for key, value in profiled_layer["variants"].items()
+            },
+        }
+    if baseline_payload is not None:
+        payload["comparison_to_previous"] = {
+            "baseline_path": baseline_path,
+            "layer_results_ms": compare_result_sections(layer_results, baseline_payload.get("layer_results_ms")),
+            "full_model_results_ms": compare_result_sections(model_results, baseline_payload.get("full_model_results_ms")),
+        }
+
     write_results(args.results_json, payload)
     write_plot(args.plot_path, payload)
 
